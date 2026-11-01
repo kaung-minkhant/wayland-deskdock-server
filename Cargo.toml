@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 ctrlc = { version = "3", features = ["termination"] }
+ksni = { version = "0.3", features = ["blocking"] }
 evdev = "0.13"
 libc = "0.2.191"
 serde = { version = "1", features = ["derive"] }

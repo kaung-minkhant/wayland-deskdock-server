@@ -82,8 +82,10 @@ pub enum InputEvent {
     },
 }
 
-/// Open and validate every configured device up front so a bad path fails
-/// before the session starts, then start one worker per device.
+/// Open and validate configured devices that are currently present, then start
+/// one worker per available device. A configured USB/Bluetooth device may be
+/// unplugged or powered down; that is not a reason to prevent the rest of the
+/// server (or its control socket) from starting.
 pub fn spawn(
     config: &Config,
     shared: &Shared,
@@ -91,12 +93,23 @@ pub fn spawn(
 ) -> Result<Vec<JoinHandle<()>>, Box<dyn Error>> {
     let mut opened = Vec::new();
     for configured in &config.devices {
-        let device = Device::open(&configured.path).map_err(|error| {
-            format!(
-                "could not open {}: {error} (is your user in the `input` group?)",
-                configured.path.display()
-            )
-        })?;
+        let device = match Device::open(&configured.path) {
+            Ok(device) => device,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!(
+                    "DeskDock: configured {} is unavailable; skipping it.",
+                    configured.path.display()
+                );
+                continue;
+            }
+            Err(error) => {
+                return Err(format!(
+                    "could not open {}: {error} (is your user in the `input` group?)",
+                    configured.path.display()
+                )
+                .into());
+            }
+        };
         validate_device(&device, configured)?;
         device.set_nonblocking(true).map_err(|error| {
             format!(
@@ -105,6 +118,12 @@ pub fn spawn(
             )
         })?;
         opened.push((configured.clone(), device));
+    }
+
+    if opened.is_empty() {
+        eprintln!(
+            "DeskDock: no configured input devices are currently available; starting without input capture."
+        );
     }
 
     Ok(opened
@@ -367,5 +386,28 @@ pub fn stop(shared: &Shared, workers: Vec<JoinHandle<()>>) {
     shared.shutdown.store(true, Ordering::SeqCst);
     for worker in workers {
         let _ = worker.join();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    #[test]
+    fn skips_configured_devices_that_are_not_present() {
+        let config = Config {
+            tablet: Default::default(),
+            devices: vec![ConfiguredDevice {
+                path: PathBuf::from(format!(
+                    "/definitely-not-present-deskdock-{}",
+                    std::process::id()
+                )),
+                kind: DeviceKind::Mouse,
+            }],
+        };
+        let (sender, _receiver) = mpsc::channel();
+        let workers = spawn(&config, &Shared::default(), &sender).unwrap();
+        assert!(workers.is_empty());
     }
 }

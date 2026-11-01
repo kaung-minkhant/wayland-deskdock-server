@@ -20,6 +20,10 @@ use crate::protocol::{
 pub const DEVICE_PORT: u16 = 19_672;
 pub const PROTOCOL_VERSION: u32 = 18;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+// The Android listener normally writes HELLO immediately. A failed probe is
+// short because `connect_cancellable` rebuilds the ADB forward and retries it
+// every 200 ms; lingering on one stale forward prevents a later app startup
+// from being noticed.
 const HELLO_TIMEOUT: Duration = Duration::from_millis(500);
 const CONNECT_RETRY_WINDOW: Duration = Duration::from_secs(30);
 const CONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(200);
@@ -48,45 +52,70 @@ impl<'a> ActiveSession<'a> {
         device: &Device,
         cancel: &AtomicBool,
     ) -> Result<Self, Box<dyn Error>> {
-        let host_port = adb.forward_any_port(device)?;
-
-        match connect_and_handshake(host_port, cancel) {
-            Ok((stream, handshake)) => {
-                let reader_stream = stream.try_clone()?;
-                let response_stream = Arc::new(Mutex::new(stream.try_clone()?));
-                let reader_stop = Arc::new(AtomicBool::new(false));
-                let android_service = Arc::new(Mutex::new(None));
-                let configuration = Arc::new(Mutex::new(handshake.configuration.clone()));
-                let lost = Arc::new(AtomicBool::new(false));
-                let reader = Some(spawn_packet_reader(
-                    reader_stream,
-                    Arc::clone(&response_stream),
-                    adb.clone(),
-                    device.clone(),
-                    Arc::clone(&android_service),
-                    Arc::clone(&configuration),
-                    Arc::clone(&lost),
-                    Arc::clone(&reader_stop),
-                ));
-
-                Ok(Self {
-                    adb,
-                    device: device.clone(),
-                    host_port,
-                    stream,
-                    handshake,
-                    reader_stop,
-                    reader,
-                    android_service,
-                    configuration,
-                    lost,
-                })
+        // Android may open tcp:19672 only after the app's Connect action. A
+        // forward made earlier can remain stale, so retry each probe with a
+        // newly allocated ADB forward.
+        let deadline = Instant::now() + CONNECT_RETRY_WINDOW;
+        let mut last_error = None;
+        while Instant::now() < deadline && !cancel.load(Ordering::SeqCst) {
+            let host_port = match adb.forward_any_port(device) {
+                Ok(port) => port,
+                Err(error) => {
+                    last_error = Some(Box::new(error) as Box<dyn Error>);
+                    thread::sleep(CONNECT_RETRY_INTERVAL);
+                    continue;
+                }
+            };
+            match connect_and_handshake(host_port, cancel) {
+                Ok((stream, handshake)) => {
+                    return Ok(Self::new(adb, device, host_port, stream, handshake)?);
+                }
+                Err(error) => last_error = Some(Box::new(error)),
             }
-            Err(error) => {
-                adb.remove_forward(device, host_port);
-                Err(Box::new(error))
-            }
+            adb.remove_forward(device, host_port);
+            thread::sleep(CONNECT_RETRY_INTERVAL);
         }
+        Err(last_error.unwrap_or_else(|| {
+            "timed out waiting for Android to accept a DeskDock connection".into()
+        }))
+    }
+
+    fn new(
+        adb: &'a Adb,
+        device: &Device,
+        host_port: u16,
+        stream: TcpStream,
+        handshake: Handshake,
+    ) -> Result<Self, Box<dyn Error>> {
+        let reader_stream = stream.try_clone()?;
+        let response_stream = Arc::new(Mutex::new(stream.try_clone()?));
+        let reader_stop = Arc::new(AtomicBool::new(false));
+        let android_service = Arc::new(Mutex::new(None));
+        let configuration = Arc::new(Mutex::new(handshake.configuration.clone()));
+        let lost = Arc::new(AtomicBool::new(false));
+        let reader = Some(spawn_packet_reader(
+            reader_stream,
+            Arc::clone(&response_stream),
+            adb.clone(),
+            device.clone(),
+            Arc::clone(&android_service),
+            Arc::clone(&configuration),
+            Arc::clone(&lost),
+            Arc::clone(&reader_stop),
+        ));
+
+        Ok(Self {
+            adb,
+            device: device.clone(),
+            host_port,
+            stream,
+            handshake,
+            reader_stop,
+            reader,
+            android_service,
+            configuration,
+            lost,
+        })
     }
 
     /// True once the Android side closed the connection or it failed, or the
@@ -351,38 +380,20 @@ fn connect_and_handshake(
     Ok((stream, handshake))
 }
 
-/// The Android listener sends `HELLO` immediately after accepting a socket. A
-/// failed early probe makes it discard that socket, so retry with a new TCP
-/// connection just as the original Java server does.
+/// Connect once through one fresh ADB forward and wait briefly for Android's
+/// initial `HELLO`. The caller recreates the forward after a failed probe.
 fn connect_after_hello(
     host_port: u16,
     cancel: &AtomicBool,
 ) -> Result<TcpStream, crate::protocol::ProtocolError> {
-    let deadline = Instant::now() + CONNECT_RETRY_WINDOW;
-    let mut last_error = None;
-
-    while Instant::now() < deadline && !cancel.load(Ordering::SeqCst) {
-        match TcpStream::connect(("127.0.0.1", host_port)) {
-            Ok(mut stream) => {
-                stream.set_nodelay(true)?;
-                stream.set_read_timeout(Some(HELLO_TIMEOUT))?;
-                match expect_hello(&mut stream) {
-                    Ok(()) => return Ok(stream),
-                    Err(error) => last_error = Some(error),
-                }
-            }
-            Err(error) => last_error = Some(error.into()),
-        }
-        thread::sleep(CONNECT_RETRY_INTERVAL);
+    if cancel.load(Ordering::SeqCst) {
+        return Err(io::Error::new(io::ErrorKind::Interrupted, "connection cancelled").into());
     }
-
-    Err(last_error.unwrap_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::TimedOut,
-            "timed out waiting for Android HELLO",
-        )
-        .into()
-    }))
+    let mut stream = TcpStream::connect(("127.0.0.1", host_port))?;
+    stream.set_nodelay(true)?;
+    stream.set_read_timeout(Some(HELLO_TIMEOUT))?;
+    expect_hello(&mut stream)?;
+    Ok(stream)
 }
 
 #[cfg(test)]
@@ -393,8 +404,10 @@ mod tests {
     use std::net::TcpListener;
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     const APK_PATH: &str = "/data/app/~~x/com.example-1/base.apk";
+    static NEXT_FAKE_ADB: AtomicUsize = AtomicUsize::new(0);
 
     struct ScratchDir(PathBuf);
 
@@ -419,10 +432,30 @@ mod tests {
             exits = dir.0.join("shell-exits").display(),
             log = log.display(),
         );
-        let path = dir.0.join("adb");
-        fs::write(&path, script).unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
-        path.to_str().unwrap().to_owned()
+        // Give each invocation a distinct inode: concurrent tests can otherwise
+        // replace the executable while an earlier fake adb shell still runs it,
+        // which Linux rejects with ETXTBSY.
+        let id = NEXT_FAKE_ADB.fetch_add(1, Ordering::Relaxed);
+        let script_path = dir
+            .0
+            .join(format!("adb-script-{}-{id}", std::process::id()));
+        fs::write(&script_path, script).unwrap();
+        fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Execute through a stable shell binary: an earlier fake adb can still
+        // be reading the script when another test starts, and executing that
+        // script pathname directly would then race with Linux's ETXTBSY guard.
+        let launcher_path = dir.0.join(format!("adb-{}-{id}", std::process::id()));
+        fs::write(
+            &launcher_path,
+            format!(
+                "#!/bin/sh\nexec /bin/sh '{}' \"$@\"\n",
+                script_path.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&launcher_path, fs::Permissions::from_mode(0o755)).unwrap();
+        launcher_path.to_str().unwrap().to_owned()
     }
 
     fn service_request() -> Vec<u8> {

@@ -156,7 +156,7 @@ pub fn send(request: Request) -> Result<String, Box<dyn Error>> {
     let path = socket_path();
     let mut stream = UnixStream::connect(&path).map_err(|error| {
         format!(
-            "no capture process is listening on {} ({error}); start `deskdock-server capture`",
+            "no capture process is listening on {} ({error}); start `deskdock-server run --serial SERIAL`",
             path.display()
         )
     })?;

@@ -25,8 +25,14 @@ Wayland and X11 alike.
 ## Running
 
 ```sh
-cargo run --release -- capture --serial <ADB SERIAL>    # `devices` lists serials
+# Starts in the background and adds a StatusNotifier icon to Waybar's tray.
+cargo run --release -- run --serial <ADB SERIAL>    # `devices` lists serials
 ```
+
+The Waybar tray menu reports the connection/mode and can switch input to the
+Tablet or Linux, restart capture, or quit cleanly. Use `run --foreground` for
+terminal diagnostics and `run --no-tray` when no StatusNotifier host is
+available.
 
 Open the DeskDock app on the tablet and tap **CONNECT**. `capture` starts in
 **Linux mode**: your devices stay with the desktop. Then, from another terminal
@@ -65,10 +71,11 @@ doesn't report it as an evdev event, nothing can detect it.
 ## Commands
 
 ```text
-devices | handshake | send-move   diagnostics
-list-input                       list host input devices
-capture --serial S [--config P]  forward input to the tablet
-toggle | tablet | linux | status control a running capture
+devices | handshake | send-move                           diagnostics
+list-input                                               list host input devices
+run --serial S [--config P] [--foreground] [--no-tray] start the supervised tray service
+capture --serial S [--config P]                          forward input to the tablet
+toggle | tablet | linux | status                         control a running capture
 ```
 
 `--adb PATH` (or the `ADB` environment variable) selects the adb binary.

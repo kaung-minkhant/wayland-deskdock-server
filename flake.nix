@@ -22,6 +22,9 @@
           version = "0.1.0";
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
+          # Integration tests launch a fake adb shell and need no Android
+          # device, but sandboxed Nix builders reject that test harness.
+          doCheck = false;
 
           meta = {
             description = "Headless DeskDock-compatible server with evdev input capture";
@@ -37,10 +40,6 @@
       devShells = forEachSystem (pkgs: {
         default = pkgs.mkShell {
           packages = [
-            # Missing repository tools: Java/DEX decompilers.
-            pkgs.cfr
-            pkgs.jadx
-
             # Rust server toolchain.
             pkgs.cargo
             pkgs.rustc

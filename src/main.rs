@@ -10,6 +10,8 @@ mod keymap;
 mod protocol;
 mod session;
 mod state;
+mod supervisor;
+mod tray;
 
 use std::env;
 use std::error::Error;
@@ -76,6 +78,25 @@ fn run() -> Result<(), Box<dyn Error>> {
             Ok(())
         }
         Command::ListInput => capture::list_devices(),
+        Command::Run {
+            adb,
+            serial,
+            config,
+            no_tray,
+            foreground,
+        } => {
+            if foreground {
+                supervisor::run_foreground(adb, serial, config, no_tray)
+            } else {
+                supervisor::run_background(adb, serial, config, no_tray)
+            }
+        }
+        Command::RunForeground {
+            adb,
+            serial,
+            config,
+            no_tray,
+        } => supervisor::run_foreground(adb, serial, config, no_tray),
         Command::Control(request) => {
             println!("{}", control::send(request)?);
             Ok(())
