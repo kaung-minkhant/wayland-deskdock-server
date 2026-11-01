@@ -1,0 +1,17 @@
+[package]
+name = "deskdock-server"
+version = "0.1.0"
+edition = "2024"
+description = "Headless DeskDock-compatible server, reconstructed from protocol evidence"
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "deskdock-server"
+path = "src/main.rs"
+
+[dependencies]
+ctrlc = { version = "3", features = ["termination"] }
+evdev = "0.13"
+libc = "0.2.191"
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"

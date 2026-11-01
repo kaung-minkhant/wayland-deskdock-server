@@ -1,0 +1,46 @@
+name: Build and cache
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build (${{ matrix.system }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - system: x86_64-linux
+            install: x86_64-linux
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v20
+        with:
+          extra-conf: |-
+            accept-flake-config = true
+
+      # The action pulls from the public cache for every build. Only trusted
+      # pushes to main receive the secret needed to upload new store paths.
+      - name: Configure Cachix
+        uses: cachix/cachix-action@v17
+        with:
+          name: wayland-deskdock-server
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          skipPush: ${{ github.event_name != 'push' }}
+
+      - name: Build package
+        run: nix build --print-build-logs .#deskdock-server
+
+      - name: Run flake checks
+        run: nix flake check --print-build-logs

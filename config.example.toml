@@ -1,0 +1,25 @@
+# Copy to ~/.config/deskdock-server/config.toml and adjust.
+# Run `deskdock-server list-input` to find stable device paths.
+# Only devices listed here are ever opened or grabbed.
+
+[tablet]
+# Multiplier for relative mouse and touchpad motion.
+sensitivity = 3
+# Touchpad travel (percent of its height) per scroll step.
+touchpad_scroll_percent = 3
+# Delay before a tap is sent, so tap-and-hold can become a drag.
+touchpad_tap_delay_ms = 200
+
+[[devices]]
+path = "/dev/input/by-id/usb-Your_Mouse-event-mouse"
+kind = "mouse"
+
+[[devices]]
+path = "/dev/input/by-path/pci-0000:00:00.0-platform-i2c-event-mouse"
+kind = "touchpad"
+
+# Optional. The keyboard is grabbed while in tablet mode, so
+# Super+Shift+T (or `deskdock-server linux`) returns control to Linux.
+# [[devices]]
+# path = "/dev/input/by-id/usb-Your_Keyboard-event-kbd"
+# kind = "keyboard"
