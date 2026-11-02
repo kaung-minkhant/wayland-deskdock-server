@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use crate::adb::Adb;
 use crate::capture::{self, InputEvent, MouseButton};
+use crate::clipboard::Clipboard;
 use crate::config::Config;
 use crate::control::ControlSocket;
 use crate::input::Event;
@@ -17,6 +18,8 @@ use crate::state::Shared;
 const POLL_INTERVAL: Duration = Duration::from_millis(2);
 const RETRY_MIN: Duration = Duration::from_secs(2);
 const RETRY_MAX: Duration = Duration::from_secs(15);
+const CLIPBOARD_POLL_INTERVAL: Duration = Duration::from_millis(700);
+const MAX_CLIPBOARD_BYTES: usize = 1024 * 1024;
 
 /// Pointer position on the Android display, in its coordinate space.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -290,8 +293,17 @@ fn run_session(
 
     let (width, height) = active.display_size();
     let mut forwarder = Forwarder::new(width, height, config.tablet.sensitivity);
+    let mut clipboard = Clipboard::new();
+    let mut next_clipboard_poll = Instant::now();
     shared.set_connected(true);
-    let result = event_loop(active, &mut forwarder, receiver, shared);
+    let result = event_loop(
+        active,
+        &mut forwarder,
+        &mut clipboard,
+        &mut next_clipboard_poll,
+        receiver,
+        shared,
+    );
 
     // Release the devices first, so a dead connection can never leave them
     // grabbed, then tell Android to stand down if it can still hear us.
@@ -308,6 +320,8 @@ fn run_session(
 fn event_loop(
     active: &mut ActiveSession<'_>,
     forwarder: &mut Forwarder,
+    clipboard: &mut Clipboard,
+    next_clipboard_poll: &mut Instant,
     receiver: &Receiver<InputEvent>,
     shared: &Shared,
 ) -> Result<Exit, Box<dyn Error>> {
@@ -323,6 +337,29 @@ fn event_loop(
             && let Err(error) = active.send_input(&event)
         {
             return Ok(Exit::Lost(error.to_string()));
+        }
+
+        for text in active.take_clipboard_updates() {
+            if text.len() > MAX_CLIPBOARD_BYTES {
+                eprintln!("ignoring Android clipboard text larger than 1 MiB");
+            } else if let Err(error) = clipboard.set_from_android(text) {
+                eprintln!("could not update the host clipboard: {error}");
+            } else {
+                eprintln!("updated host clipboard from Android");
+            }
+        }
+        if Instant::now() >= *next_clipboard_poll {
+            match clipboard.poll_local_change() {
+                Ok(Some(text)) if text.len() <= MAX_CLIPBOARD_BYTES => {
+                    if let Err(error) = active.send_input(&Event::Clipboard { text }) {
+                        return Ok(Exit::Lost(error.to_string()));
+                    }
+                }
+                Ok(Some(_)) => eprintln!("ignoring clipboard text larger than 1 MiB"),
+                Ok(None) => {}
+                Err(error) => eprintln!("could not read the host clipboard: {error}"),
+            }
+            *next_clipboard_poll = Instant::now() + CLIPBOARD_POLL_INTERVAL;
         }
 
         let want_tablet = shared.is_tablet();

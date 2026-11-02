@@ -54,6 +54,10 @@ Ctrl+C or SIGTERM releases everything cleanly.
   at once and `capture` retries with a 2 s to 15 s backoff.
 * Tablet mode is refused while there is no connection.
 * Screen rotation is followed: the pointer is rescaled to the new size.
+* Plain-text clipboard changes are synchronized in both directions while a
+  session is connected. This requires `wl-clipboard` (`wl-copy` and `wl-paste`)
+  in the daemon's `PATH`; clipboard failures leave input forwarding unaffected.
+  An empty Wayland clipboard is normal and is ignored until text is copied.
 
 ## Gestures
 

@@ -38,6 +38,9 @@ pub struct ActiveSession<'a> {
     reader_stop: Arc<AtomicBool>,
     reader: Option<JoinHandle<()>>,
     android_service: Arc<Mutex<Option<AndroidService>>>,
+    /// Clipboard updates received from Android, without their sensitive text
+    /// ever entering logs.
+    clipboard: Arc<Mutex<Vec<String>>>,
     /// Latest display configuration; Android re-announces it on rotation.
     configuration: Arc<Mutex<Configuration>>,
     /// Set by the reader thread when the connection ended without our asking.
@@ -91,6 +94,7 @@ impl<'a> ActiveSession<'a> {
         let response_stream = Arc::new(Mutex::new(stream.try_clone()?));
         let reader_stop = Arc::new(AtomicBool::new(false));
         let android_service = Arc::new(Mutex::new(None));
+        let clipboard = Arc::new(Mutex::new(Vec::new()));
         let configuration = Arc::new(Mutex::new(handshake.configuration.clone()));
         let lost = Arc::new(AtomicBool::new(false));
         let reader = Some(spawn_packet_reader(
@@ -99,6 +103,7 @@ impl<'a> ActiveSession<'a> {
             adb.clone(),
             device.clone(),
             Arc::clone(&android_service),
+            Arc::clone(&clipboard),
             Arc::clone(&configuration),
             Arc::clone(&lost),
             Arc::clone(&reader_stop),
@@ -113,6 +118,7 @@ impl<'a> ActiveSession<'a> {
             reader_stop,
             reader,
             android_service,
+            clipboard,
             configuration,
             lost,
         })
@@ -143,6 +149,16 @@ impl<'a> ActiveSession<'a> {
     /// Send one typed family-2 input event over the established session.
     pub fn send_input(&mut self, event: &Event) -> Result<(), crate::protocol::ProtocolError> {
         input::send(&mut self.stream, event)
+    }
+
+    /// Take clipboard text updates that Android sent since the previous call.
+    pub fn take_clipboard_updates(&self) -> Vec<String> {
+        std::mem::take(
+            &mut *self
+                .clipboard
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        )
     }
 }
 
@@ -190,13 +206,15 @@ pub fn print_connection(active: &ActiveSession<'_>) {
 
 /// Mirrors the original server's `cz` thread: after the handshake it must
 /// continuously consume Android-originated frames. The packet formats beyond
-/// their family tag are still being reconstructed, so preserve them in logs.
+/// their family tag are still being reconstructed, so report only frame
+/// metadata in diagnostics; payloads can contain private clipboard text.
 fn spawn_packet_reader(
     mut stream: TcpStream,
     response_stream: Arc<Mutex<TcpStream>>,
     adb: Adb,
     device: Device,
     android_service: Arc<Mutex<Option<AndroidService>>>,
+    clipboard: Arc<Mutex<Vec<String>>>,
     configuration: Arc<Mutex<Configuration>>,
     lost: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
@@ -208,6 +226,7 @@ fn spawn_packet_reader(
             &adb,
             &device,
             &android_service,
+            &clipboard,
             &configuration,
             &stop,
         );
@@ -223,6 +242,7 @@ fn read_packets(
     adb: &Adb,
     device: &Device,
     android_service: &Arc<Mutex<Option<AndroidService>>>,
+    clipboard: &Mutex<Vec<String>>,
     configuration: &Mutex<Configuration>,
     stop: &AtomicBool,
 ) {
@@ -246,13 +266,30 @@ fn read_packets(
                     continue;
                 }
 
+                if let Some(text) = decode_android_clipboard_update(&payload) {
+                    // Clipboard contents are private: report only metadata for
+                    // live troubleshooting, never the copied text itself.
+                    eprintln!("received Android clipboard update ({} bytes)", text.len());
+                    clipboard
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .push(text);
+                    continue;
+                }
+
+                // Do not include a payload preview: Android frames may carry
+                // clipboard contents. Family/subtype/size identify the wire
+                // format without disclosing copied text.
                 eprintln!(
-                    "received Android frame: family={}, bytes={}, payload={}",
+                    "received Android frame: family={}, subtype={}, bytes={}",
                     family
                         .map(|family| family.to_string())
                         .unwrap_or_else(|| "<missing>".to_owned()),
+                    payload
+                        .get(4)
+                        .map(|subtype| subtype.to_string())
+                        .unwrap_or_else(|| "<missing>".to_owned()),
                     payload.len(),
-                    payload_preview(&payload)
                 );
 
                 if let Err(error) = start_and_acknowledge_android_service_request(
@@ -278,6 +315,14 @@ fn read_packets(
             }
         }
     }
+}
+
+/// Family-2 subtype 1 carries Android clipboard updates as UTF-8 bytes to the
+/// end of the outer frame. The same subtype sets Android's clipboard when sent
+/// by the desktop.
+fn decode_android_clipboard_update(payload: &[u8]) -> Option<String> {
+    let text = payload.strip_prefix(&[0, 0, 0, 2, 1])?;
+    std::str::from_utf8(text).ok().map(ToOwned::to_owned)
 }
 
 fn apply_configuration_update(payload: &[u8], configuration: &Mutex<Configuration>) {
@@ -354,19 +399,6 @@ fn decode_service_apk_path(payload: &[u8]) -> Result<&str, crate::protocol::Prot
         ));
     }
     std::str::from_utf8(path).map_err(|_| crate::protocol::ProtocolError::InvalidUtf8("APK path"))
-}
-
-fn payload_preview(payload: &[u8]) -> String {
-    const PREVIEW_BYTES: usize = 32;
-    let mut preview = payload
-        .iter()
-        .take(PREVIEW_BYTES)
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    if payload.len() > PREVIEW_BYTES {
-        preview.push_str("…");
-    }
-    preview
 }
 
 fn connect_and_handshake(
@@ -641,6 +673,19 @@ mod tests {
         let cancel = AtomicBool::new(true);
         assert!(ActiveSession::connect_cancellable(&adb, &device, &cancel).is_err());
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn decodes_android_clipboard_updates_as_utf8_text() {
+        assert_eq!(
+            decode_android_clipboard_update(&[0, 0, 0, 2, 1, b'h', b'i']),
+            Some("hi".to_owned())
+        );
+        assert_eq!(
+            decode_android_clipboard_update(&[0, 0, 0, 2, 1, 0xff]),
+            None
+        );
+        assert_eq!(decode_android_clipboard_update(&[0, 0, 0, 2, 7]), None);
     }
 
     #[test]

@@ -2,6 +2,7 @@ mod adb;
 mod bridge;
 mod capture;
 mod cli;
+mod clipboard;
 mod config;
 mod control;
 mod input;

@@ -36,6 +36,11 @@ pub enum Event {
         horizontal: i32,
         vertical: i32,
     },
+    /// UTF-8 clipboard text (family-2 subtype 1). The outer frame bounds the
+    /// text, so this subtype has no inner length field.
+    Clipboard {
+        text: String,
+    },
 }
 
 impl Event {
@@ -88,6 +93,10 @@ impl Event {
                 payload.extend_from_slice(&y.to_be_bytes());
                 payload.extend_from_slice(&horizontal.to_be_bytes());
                 payload.extend_from_slice(&vertical.to_be_bytes());
+            }
+            Self::Clipboard { text } => {
+                payload.push(1);
+                payload.extend_from_slice(text.as_bytes());
             }
         }
 
@@ -180,6 +189,17 @@ mod tests {
             }
             .encode(),
             [0, 0, 0, 2, 4, 0, 0, 0, 1, 0, 0, 0, 0, 10, 0, 0, 0, 20,]
+        );
+    }
+
+    #[test]
+    fn encodes_a_clipboard_update() {
+        assert_eq!(
+            Event::Clipboard {
+                text: "hi".to_owned(),
+            }
+            .encode(),
+            [0, 0, 0, 2, 1, b'h', b'i']
         );
     }
 }
